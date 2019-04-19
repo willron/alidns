@@ -1,0 +1,275 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import sys
+import json
+import time
+import hmac
+import random
+import hashlib
+import datetime
+import requests
+import binascii
+reload(sys)
+sys.setdefaultencoding('utf8')
+
+
+API_SECRETID = 'xxxxxxxx'
+API_SECRETKEY = 'xxxxxxxx'
+API_URL = 'cns.api.qcloud.com/v2/index.php'
+DEFAULT_DOMAIN = 'example.com'  # 默认操作域名
+
+
+class Sign:
+    """
+    腾讯云签名类， copy了腾讯云自己的SDK，免得造轮子
+    """
+    def __init__(self, secretid, secretkey):
+        self.secretid = secretid
+        self.secretkey = secretkey
+        if sys.version_info[0] > 2:
+            self.Py2 = False
+        else:
+            self.Py2 = True
+
+    def make(self, requesturl, params, method='POST', sign_method='HmacSHA1'):
+        new_params = {}
+        for param_key in params:
+            if method == 'POST' and str(params[param_key])[0:1] == "@":
+                continue
+            new_params[param_key] = params[param_key]
+        srcstr = method.upper() + requesturl + '?' + '&'.join(
+            k.replace('_', '.') + '=' + str(new_params[k]) for k in sorted(new_params.keys()))
+        if sign_method == 'HmacSHA256':
+            if self.Py2:
+                hashed = hmac.new(self.secretkey, srcstr, hashlib.sha256)
+            else:
+                hashed = hmac.new(bytes(self.secretkey, 'utf-8'), bytes(srcstr, 'utf-8'), hashlib.sha256)
+        else:
+            if self.Py2:
+                hashed = hmac.new(self.secretkey, srcstr, hashlib.sha1)
+            else:
+                hashed = hmac.new(bytes(self.secretkey, 'utf-8'), bytes(srcstr, 'utf-8'), hashlib.sha1)
+
+        if self.Py2:
+            return binascii.b2a_base64(hashed.digest())[:-1]
+        else:
+            return binascii.b2a_base64(hashed.digest())[:-1].decode()
+
+
+class CnsApi(object):
+    """
+    腾讯云cns云解析接口调用
+    """
+    def __init__(self, secretid, secretkey):
+        self.secretid = secretid
+        self.secretkey = secretkey
+        self.req_data = {}
+
+    def _common_args(self):
+        """
+        接口的公共参数
+        :return:
+        """
+        data = {
+            'SecretId': self.secretid,
+            'Nonce': random.randint(1, 100),
+            'Timestamp': int(time.mktime(datetime.datetime.now().timetuple())),
+        }
+        return data
+
+    def send_req(self):
+        """
+        接口请求发起
+        :return:
+        """
+        self.req_data.update(self._common_args())
+        sign = Sign(self.secretid, self.secretkey)
+        sign_str = sign.make(API_URL, self.req_data)
+        self.req_data.update({'Signature': sign_str})
+
+        try:
+            r = requests.post('https://' + API_URL, data=self.req_data)
+            rr = r.json()
+            if rr['codeDesc'] == 'Success':
+                if 'data' in rr:
+                    return rr['data']
+                else:
+                    return rr
+            else:
+                print('Error: {}'.format(rr['message'].encode('utf8')))
+                sys.exit(1)
+
+        except Exception as err:
+            print('Post Error: {}'.format(err))
+            sys.exit(1)
+
+    def listrecord(self, opts):
+        """
+        显示记录
+        :param opts:
+        :return:
+        """
+        self.req_data['Action'] = 'RecordList'
+        self.req_data['domain'] = opts.domain or DEFAULT_DOMAIN
+        opts.offset and self.req_data.update({'offset': opts.offset})
+        opts.length and self.req_data.update({'length': opts.length})
+        opts.sub_domain and self.req_data.update({'subDomain': opts.sub_domain})
+        opts.type and self.req_data.update({'recordType': opts.type})
+        return self.send_req()
+
+    def addrecord(self, opts):
+        """
+        增加解析记录
+        :param opts:
+        :return:
+        """
+        self.req_data['Action'] = 'RecordCreate'
+        self.req_data['domain'] = opts.domain or DEFAULT_DOMAIN
+        self.req_data['subDomain'] = opts.sub_domain
+        self.req_data['recordType'] = opts.type
+        self.req_data['recordLine'] = opts.line
+        self.req_data['value'] = opts.value
+        opts.ttl and self.req_data.update({'ttl': opts.ttl})
+        return self.send_req()
+
+    def setstatus(self, opts):
+        """
+        暂停，开启解析
+        :param opts:
+        :return:
+        """
+        self.req_data['Action'] = 'RecordStatus'
+        self.req_data['domain'] = opts.domain or DEFAULT_DOMAIN
+        self.req_data['recordId'] = opts.recordid
+        self.req_data['status'] = opts.status
+        return self.send_req()
+
+    def modifyrecord(self, opts):
+        """
+        修改解析记录
+        :param opts:
+        :return:
+        """
+        self.req_data['Action'] = 'RecordModify'
+        self.req_data['domain'] = opts.domain or DEFAULT_DOMAIN
+        self.req_data['recordId'] = opts.recordid
+        self.req_data['subDomain'] = opts.sub_domain
+        self.req_data['recordType'] = opts.type
+        self.req_data['recordLine'] = opts.line
+        self.req_data['value'] = opts.value
+        opts.ttl and self.req_data.update({'ttl': opts.ttl})
+        return self.send_req()
+
+
+if __name__ == '__main__':
+
+    from optparse import OptionParser
+
+    usage = 'usage: %prog [options] [ ListRecord | AddRecord | ModifyRecord | SetStatus ]'
+    parser = OptionParser(usage)
+
+    # 与API参数有关的参数，大写
+    parser.add_option('-I', '--record-id', dest='recordid', type='int', help='the record id')
+    parser.add_option('-S', '--sub-domain', dest='sub_domain', help='sub domain, like www')
+
+    parser.add_option('-A', '--record-status', dest='status', help='record status : [ enable | disable ]')
+
+    parser.add_option('-D', '--domain', dest='domain', default='ksgame.com',
+                      help='the target domain, default: ksgame.com')
+
+    parser.add_option('-V', '--value', dest='value', help='the value to record')
+
+    parser.add_option('-T', '--type', dest='type',
+                      help='record type. default is A. all type : [ A | CNAME | MX | NS | TXT | AAAA ]')
+
+    parser.add_option('-M', '--ttl', dest='ttl', default=600, type='int', help='TTL. default 600')
+
+    parser.add_option('-L', '--line', dest='line', default='默认',
+                      help=u'line for record. default is "默认" line. '
+                           u'all line: [默认|境内|境外|电信|联通|移动]')
+
+    # 脚本相关参数，小写
+    parser.add_option('-o', '--offset', dest='offset', help='set offset')
+    parser.add_option('-l', '--length', dest='length', default=20, help='set length', type='int')
+    parser.add_option('-t', '--table-output', action='store_true', dest='tableoutput', help='format output to table')
+    parser.add_option('-j', '--json-output', action='store_true', dest='jsonoutput', help='format output to json')
+
+    (options, args) = parser.parse_args()
+
+    allow_action = ['ListRecord', 'AddRecord', 'ModifyRecord', 'SetStatus']
+
+    if options.tableoutput and options.jsonoutput:
+        parser.error('do not put json-output (-j) and table-output (-t) together!')
+
+    if len(args) < 1 or args[0] not in allow_action:
+        parser.error('need one of {}'.format(', '.join(allow_action)))
+
+    options.type not in [None, 'A', 'CNAME', 'MX', 'NS', 'TXT', 'AAAA'] and parser.error('invalid type (-T)')
+    options.line not in [None, '默认', '境内', '境外', '电信', '联通', '移动'] and parser.error('invalid line (-L)')
+    options.status not in [None, 'disable', 'enable'] and parser.error('invalid status (-A)')
+
+    if args[0] == 'AddRecord':
+        not all([options.sub_domain, options.value, options.type]) and parser.error(
+            'AddRecord need sub domain (-S) and value (-V) and type (-T) options '
+        )
+
+    if args[0] == 'ModifyRecord':
+        not all([options.sub_domain, options.value, options.recordid, options.type]) and parser.error(
+            'ModifyRecord need sub domain (-S) and value (-V) options and record id (-I) and type (-T) options'
+        )
+
+    if args[0] == 'SetStatus':
+        not all([options.recordid, options.status]) and parser.error(
+            'SetStatus need record id (-I) and status (-A) options'
+        )
+
+    cnsapi = CnsApi(API_SECRETID, API_SECRETKEY)
+
+    if not hasattr(cnsapi, args[0].lower()):
+        parser.error('action must be on of ListRecord, AddRecord, ModifyRecord, SetStatus')
+
+    api_handle = getattr(cnsapi, args[0].lower())
+    response = api_handle(options)
+
+    if response:
+        # 输出格式化
+        if options.jsonoutput:
+            print(json.dumps(response, ensure_ascii=False, indent=4))
+        else:
+            if options.tableoutput:
+                from prettytable import PrettyTable
+                if args[0] == 'ListRecord':
+                    t = PrettyTable(['RecordID', 'Name', 'Type', 'Value', 'Line', 'Status'])
+                    t.align['Name'] = 'l'
+                    t.align['Value'] = 'l'
+                    t.padding_width = 1
+                    for i in response['records']:
+                        row = [i['id'], i['name'], i['type'], i['value'], i['line'], i['status']]
+                        t.add_row(row)
+                elif args[0] == 'AddRecord':
+                    t = PrettyTable(['RecordID', 'Name', 'Status'])
+                    row = [response['record']['id'], response['record']['name'], response['record']['status']]
+                    t.add_row(row)
+                elif args[0] == 'ModifyRecord':
+                    t = PrettyTable(['RecordID', 'Name', 'Value', 'Status'])
+                    row = [response['record']['id'], response['record']['name'], response['record']['value'], response['record']['status']]
+                    t.add_row(row)
+                else:
+                    t = PrettyTable(['RecordID', 'Status', 'Desc'])
+                    row = [options.recordid, options.status, response['codeDesc']]
+                    t.add_row(row)
+                print(t)
+            else:
+                if args[0] == 'ListRecord':
+                    for i in response['records']:
+                        print('{id} {name} {type} {value} {line} {status}'.format(**i))
+                elif args[0] == 'AddRecord':
+                    print('{id} {name} {status}'.format(**response['record']))
+                elif args[0] == 'ModifyRecord':
+                    print('{id} {name} {value} {status}'.format(**response['record']))
+                elif args[0] == 'SetStatus':
+                    print('{} {} {}'.format(options.recordid, options.status, response['codeDesc']))
+
+    else:
+        print('There is return False!')
